@@ -1,96 +1,64 @@
-const baileys = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeInMemoryStore, DisconnectReason } = require('@whiskeysockets/baileys');
 const Pino = require('pino');
 const fs = require('fs');
+const path = require('path');
 
-// Load config
-const config = JSON.parse(fs.readFileSync('./config.json'));
+// Gunakan folder auth_info untuk menyimpan sesi login
+const authFolder = './auth_info';
 
-// Status
-let isBotActive = true;
-try {
-    const data = JSON.parse(fs.readFileSync('./status.json'));
-    isBotActive = data.aktif ?? true;
-} catch { isBotActive = true; }
+// Inisialisasi penyimpanan log
+const store = makeInMemoryStore({ logger: Pino().child({ level: 'debug', stream: 'store' }) });
+store?.readFromFile(path.join(authFolder, 'baileys_store.json'));
 
-// Fungsi ubah status
-function setActive(status) {
-    isBotActive = status;
-    fs.writeFileSync('./status.json', JSON.stringify({ aktif: status }, null, 2));
-}
+// Simpan log secara berkala
+setInterval(() => {
+    store?.writeToFile(path.join(authFolder, 'baileys_store.json'));
+}, 10_000);
 
 async function startSock() {
-    const { version } = await baileys.fetchLatestBaileysVersion();
-    const { state, saveCreds } = await baileys.useMultiFileAuthState('auth_info');
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+    const { version } = await fetchLatestBaileysVersion();
 
-    const sock = baileys.default({
+    const sock = makeWASocket({
         version,
         logger: Pino({ level: 'silent' }),
-        auth: state
+        printQRInTerminal: true,
+        auth: state,
+        browser: ['Bot DailyWorker', 'Chrome', '1.0.0']
     });
 
-    sock.ev.on('connection.update', ({ connection, qr }) => {
-        if (qr) qrcode.generate(qr, { small: true });
-        if (connection === 'open') {
-            console.log('✅ Bot siap!');
-        }
-    });
+    store.bind(sock.ev);
 
-    sock.ev.on('creds.update', saveCreds);
+    // Event pesan masuk
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type === 'notify') {
+            const msg = messages[0];
+            const sender = msg.key.remoteJid;
+            const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
 
-    sock.ev.on('messages.upsert', ({ type, messages }) => {
-        if (type !== 'notify') return;
+            console.log('Pesan masuk:', text);
 
-        for (const msg of messages) {
-            if (!msg.message) continue;
-
-            const from = msg.key.remoteJid;
-            const sender = msg.key.participant || from;
-            const text = (
-                msg.message.conversation ||
-                msg.message.extendedTextMessage?.text ||
-                ''
-            ).toLowerCase().trim();
-
-            // Admin control
-            if (config.admins.includes(sender)) {
-                if (text === 'bot on') {
-                    setActive(true);
-                    sock.sendMessage(from, { text: '✅ Bot diaktifkan oleh admin.' });
-                    continue;
-                }
-                if (text === 'bot off') {
-                    setActive(false);
-                    sock.sendMessage(from, { text: '⛔ Bot dinonaktifkan oleh admin.' });
-                    continue;
-                }
-            }
-
-            if (!isBotActive) continue;
-
-            // Pencocokan cepat (prioritaskan exact/startsWith)
-            for (const [keyword, reply] of Object.entries(config.keywords)) {
-                if (text === keyword || text.startsWith(keyword)) {
-                    // Kirim langsung tanpa await
-                    sock.sendMessage(from, { text: reply });
-                    break;
-                }
+            // Contoh respon otomatis
+            if (text.toLowerCase().includes('halo')) {
+                await sock.sendMessage(sender, { text: 'Hai! Ada yang bisa saya bantu?' });
             }
         }
     });
 
+    // Event koneksi
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
-            const reason = (lastDisconnect?.error)?.output?.statusCode;
-            if (reason !== baileys.DisconnectReason.loggedOut) {
-                console.log('⚠️ Koneksi terputus. Reconnect...');
-                startSock();
-            } else {
-                console.log('❌ Logout. Hapus auth_info dan scan ulang QR.');
-            }
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Koneksi terputus. Reconnect...', shouldReconnect);
+            if (shouldReconnect) startSock();
+        } else if (connection === 'open') {
+            console.log('✅ Terhubung ke WhatsApp!');
         }
     });
+
+    // Simpan kredensial saat ada perubahan
+    sock.ev.on('creds.update', saveCreds);
 }
 
 startSock();
